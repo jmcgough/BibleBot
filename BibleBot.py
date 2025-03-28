@@ -1,189 +1,115 @@
-#! /usr/bin/python
-"""
-#/*****************************************************
-#*****************************************************
-#**
-#** SOURCE NAME | BibleBot.py
-#**             |
-#**    SYNOPSIS | BibleBot.py
-#**             |
-#** DESCRIPTION | Sends back Bible verse as a reply for
-#**             | Tweet/Message to it with hashtag #bverse
-#**             |
-#**     CHANGES | Programmer:         Date:       Reason/Comments
-#**             | Jeffrey B. McGough  01-02-2016  Initial
-#**             |
-#**             |
-#**       NOTES | This is a TwitterBot that looks for the
-#**             | hashtag #bverse in Tweets and Messages sent
-#**             | to it, and replies back with a Bible verse.
-#**             | Working Example: @mcgoobot Send me a #bverse
-#**             |
-#**             | It requires tweepy, a Python Twitter API,
-#**             | found here: http://www.tweepy.org/
-#**             | It also needs Python Requests, I am not sure
-#**             | if it is standard install or not:
-#**             | http://docs.python-requests.org/en/latest/
-#**             |
-#****************************************************/
-"""
+#! /usr/bin/env python3
 
-import re
+import os
+import logging
+import logging.handlers
+import os
+import random
+import time
+
 import requests
-import sys
 import tweepy
+from systemd import journal
 
-#
-# This is where we get our account keys for Twitter
-####
-from TApiKeys import *
-
-def authenticate():
-    """Authenticate us to Twitter"""
-    auth = tweepy.OAuthHandler(C_Key, C_Secret)
-    auth.set_access_token(A_Token_Key, A_Token_Secret)
-    return(tweepy.API(auth))
-
-def getverse():
-    """Get bible verse"""
-    # I would rather have KJV, but this is the best API
-    # I have found and it is ESV
-    # Nice thing is we can just plug in a new API here...
-    ####
-    payload = {'key': 'IP', 'output-format': 'plain-text',  \
-               'include-footnotes': 'false', \
-               'include-verse-numbers': 'false', \
-               'include-first-verse-numbers': 'false', \
-               'include-passage-horizontal-lines': 'false', \
-               'include-heading-horizontal-lines': 'false', \
-               'include-headings': 'false', \
-               'include-subheadings': 'false', \
-               'line-length': '0', \
-               'include-short-copyright': 'true'}
-    bvurl = 'http://www.esvapi.org/v2/rest/verse'
+# Configure logging
+def setup_logging():
+    """Sets up logging to either journald or syslog based on availability."""
+    logger = logging.getLogger(__name__)
+    logger.setLevel(logging.INFO)
 
     try:
-        bv = requests.get(bvurl, params=payload)
-    except (ConnectionError, HTTPError, TooManyRedirects, Timeout,
-            RequestException):
-        sys.exit(1)
+        handler = journal.JournaldLogHandler()
+        log_type = "journald"
+    except ImportError:
+        handler = logging.handlers.SysLogHandler(address='/dev/log')
+        log_type = "syslog"
 
-    clean_verse = re.sub('\s+', ' ', bv.text)
+    formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
+    handler.setFormatter(formatter)
+    logger.addHandler(handler)
 
-    if re.search('\(ESV\)', clean_verse):
-        return(clean_verse)
-    else:
-        clean = clean_verse + " (ESV)"
-        return(clean)
+    return logger, log_type
 
-def chunktext(text, tlength):
-    """Return a list of strings in chunks of length"""
-    # Kinda happy with this chunking function, it should probably
-    # have more generic named varibles, and called more generic.
-    # It chunks what ever text you input to at most the length you request.
-    # Chunked at spaces, so as to not split words.
-    ####
-    wspace = re.compile("\s")
-    chunks = list()
-    txtlen = len(text)
-    remainder = txtlen % tlength
+# Set up logging
+log, log_type = setup_logging()
 
-    numberofchunks = txtlen / tlength
+log.info(f"Starting BibleBot with {log_type} logging...")  # Add a startup message
 
-    if remainder > 0:
-        numberofchunks += 1
+# Load X API credentials from environment variables
+API_KEY = os.getenv("X_API_KEY")
+API_SECRET = os.getenv("X_API_SECRET")
+ACCESS_TOKEN = os.getenv("X_ACCESS_TOKEN")
+ACCESS_TOKEN_SECRET = os.getenv("X_ACCESS_TOKEN_SECRET")
 
-    start = 0
-    end = tlength
+# Authenticate with X API v2
+client = tweepy.Client(
+    consumer_key=API_KEY,
+    consumer_secret=API_SECRET,
+    access_token=ACCESS_TOKEN,
+    access_token_secret=ACCESS_TOKEN_SECRET
+)
 
-    # This is the work - We splice up text into chunks
-    # we know the number of chunks needed, and if we use up
-    # the remainder of the last chunk do to word breaks
-    # we will add another chunk
-    ####
-    for chunk in range(numberofchunks):
+# Function to get a random Bible verse from bible-api.com
+def get_random_verse():
+    """
+    Retrieves a random Bible verse from the bible-api.com API.
 
-        if wspace.match(text[end:]):
-            chunks.insert(chunk, text[start:end])
-            start = (end + 1) # This steps over the end space
-            end = (start + tlength)
+    Returns:
+        str: A formatted string containing the verse text and reference,
+             or a fallback verse if the API request fails.
+    """
+    url = "https://bible-api.com//data/kjv/random"
+    max_retries = 3
+    retry_delay = 1  # seconds
 
-        else:
-            for char in reversed(text[:end]):
-                end -= 1
+    for attempt in range(max_retries):
+        try:
+            response = requests.get(url)
+            response.raise_for_status()  # Raise HTTPError for bad responses (4xx or 5xx)
 
-                if wspace.match(char):
-                    chunks.insert(chunk, text[start:end])
-                    start = (end + 1) # This steps over the end space
-                    end = (start + tlength)
-
-                    break
-
-    if chunk == numberofchunks -1 and start < txtlen:
-        chunks.append(text[start:])
-
-    return(chunks)
-
-
-def main():
-    """For Stand Alone Invocation"""
-
-    #
-    # Read in the last since_id
-    ####
-    try:
-        with open('/var/tmp/SinceID.txt', 'r') as idcount:
-            since_id = long(idcount.readline())
-    except (ValueError, IOError):
-        since_id = long(0)
-
-    #
-    # We made it this far now Authenticate to Twitter
-    ####
-    api = authenticate()
-
-    #
-    # Setup a list to capture who we send Bible verses to
-    ####
-    trepto = list()
-
-    if since_id:
-        mentions = api.mentions_timeline(since_id)
-    else:
-        mentions = api.mentions_timeline()
-
-    for tweet in mentions:
-
-        if since_id < tweet.id:
-            since_id = tweet.id
-
-        if re.search('#bverse', tweet.text, re.IGNORECASE):
-            trepto.append(tweet.user.screen_name)
-    #
-    # This helps us to be more efficient, we only get a verse
-    # if someone has requested one, and we only get one verse
-    # for each run. Every request in a run gets the same verse.
-    # trepto is twitter reply to [:^P I hate varible naming...
-    ####
-    if trepto:
-        slength = 120
-        verse = getverse()
-
-        for tname in trepto:
-            if len(verse) <= slength:
-                rverse = "@" + tname + " " + verse
-                api.update_status(status=rverse)
+            if response.status_code == 200:
+                data = response.json()
+                verse_data = data["random_verse"]
+                book = verse_data["book"]
+                chapter = verse_data["chapter"]
+                verse_num = verse_data["verse"]
+                text = verse_data["text"].strip()
+                translation = data["translation"]["identifier"].upper()
+                reference = f"{book} {chapter}:{verse_num}, {translation}"
+                return f"'{text}' ({reference})"
+            elif response.status_code == 429:
+                log.warning(f"Rate limited on attempt {attempt + 1}. Retrying after delay.")
+                time.sleep(retry_delay)
+                retry_delay *= 2
             else:
-                cverse = chunktext(verse, slength)
-                for s in reversed(cverse):
-                    rverse = "@" + tname + " " + s
-                    api.update_status(status=rverse)
+                log.error(f"Attempt {attempt + 1} failed: HTTP status code {response.status_code}")
 
+        except requests.exceptions.RequestException as e:
+            log.error(f"Attempt {attempt + 1} failed: {e}")
+            if attempt < max_retries - 1:
+                time.sleep(retry_delay)
+                retry_delay *= 2  # Exponential backoff
+        except (KeyError, ValueError) as e:
+            log.error(f"Error parsing JSON: {e}")
+            break  # stop retrying if the json is bad
+
+    # Fallback verses
+    fallback_verses = [
+        "John 3:16 - For God so loved the world, that he gave his only begotten Son, that whosoever believeth in him should not perish, but have everlasting life. - John 3:16 KJV",
+        "Psalm 23:1 - The Lord is my shepherd; I shall not want. - Psalm 23:1 KJV",
+        "Romans 8:28 - And we know that all things work together for good to them that love God, to them who are the called according to his purpose. - Romans 8:28 KJV"
+    ]
+    # Return a random fallback verse
+    return random.choice(fallback_verses)
+
+# Function to post to X
+def post_verse():
+    tweet = get_random_verse()
     try:
-        with open('/var/tmp/SinceID.txt', 'w') as idcount:
-            idcount.write(str(since_id) + "\n")
-    except IOError:
-        pass
+        response = client.create_tweet(text=tweet)
+        log.info(f"Posted: {tweet}")
+    except tweepy.TweepyException as e:
+        log.error(f"Error posting: {e}")
 
-if __name__ == '__main__':
-    main()
+if __name__ == "__main__":
+    post_verse()
